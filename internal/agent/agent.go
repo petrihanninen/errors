@@ -1,17 +1,23 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"os/exec"
 	"strings"
 
-	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/petrihanninen/errors/internal/db"
 )
 
-const maxTurns = 50
+const DefaultSystemPrompt = `You are fixing a production error in the duunitori5 Django backend.
+
+Please investigate and fix this error. Look at the relevant source code based on the transactionUiName and request.uri fields to understand where the error occurs.
+
+Be thorough and detailed when investigating the error. Focus on resolving the root cause, not just swallowing errors. If you cannot determine the root cause or fix the error, say "CANNOT_FIX" as the very last line of your response. Err on the side of caution and prefer saying "CANNOT_FIX" rather than doing an incomplete fix.
+
+After making your changes, run dev-check to ensure there are no linting or type errors: make dev-check
+
+Fix any issues that dev-check reports before finishing.`
 
 type FixResult struct {
 	Success   bool
@@ -19,87 +25,27 @@ type FixResult struct {
 	Output    string
 }
 
-type Agent struct {
-	client       *anthropic.Client
-	repoDir      string
-	systemPrompt string
-}
-
-func New(apiKey, repoDir, systemPrompt string) *Agent {
-	client := anthropic.NewClient()
+func Fix(repoDir, systemPrompt string, eg *db.ErrorGroup, occs []db.ErrorOccurrence) (*FixResult, error) {
 	if systemPrompt == "" {
 		systemPrompt = DefaultSystemPrompt
 	}
-	return &Agent{
-		client:       &client,
-		repoDir:      repoDir,
-		systemPrompt: systemPrompt,
-	}
-}
 
-func (a *Agent) Fix(ctx context.Context, eg *db.ErrorGroup, occs []db.ErrorOccurrence) (*FixResult, error) {
-	errorContext := buildErrorContext(eg, occs)
+	prompt := buildPrompt(systemPrompt, eg, occs)
 
-	messages := []anthropic.MessageParam{
-		anthropic.NewUserMessage(anthropic.NewTextBlock(errorContext)),
-	}
-	tools := toolDefinitions()
+	cmd := exec.Command("claude", "--print", "--dangerously-skip-permissions", "-p", prompt)
+	cmd.Dir = repoDir
 
-	var outputLog strings.Builder
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
 
-	for turn := 0; turn < maxTurns; turn++ {
-		log.Printf("  Agent turn %d/%d", turn+1, maxTurns)
-
-		resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-			Model:     anthropic.ModelClaude4Sonnet20250514,
-			MaxTokens: 8192,
-			System: []anthropic.TextBlockParam{
-				{Text: a.systemPrompt},
-			},
-			Messages: messages,
-			Tools:    tools,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("anthropic API call: %w", err)
-		}
-
-		// Process response blocks
-		var toolResults []anthropic.ContentBlockParamUnion
-		for _, block := range resp.Content {
-			switch b := block.AsAny().(type) {
-			case anthropic.TextBlock:
-				outputLog.WriteString(b.Text)
-				outputLog.WriteString("\n")
-				log.Printf("  [assistant] %s", truncate(b.Text, 200))
-			case anthropic.ToolUseBlock:
-				inputJSON, _ := json.Marshal(b.Input)
-				log.Printf("  [tool_use] %s(%s)", b.Name, truncate(string(inputJSON), 100))
-
-				result, err := executeTool(b.Name, json.RawMessage(inputJSON), a.repoDir)
-				if err != nil {
-					result = fmt.Sprintf("Error: %v", err)
-				}
-				log.Printf("  [tool_result] %s", truncate(result, 200))
-				outputLog.WriteString(fmt.Sprintf("\n[Tool: %s] %s\n", b.Name, truncate(result, 500)))
-
-				toolResults = append(toolResults, anthropic.NewToolResultBlock(b.ID, result, false))
-			}
-		}
-
-		messages = append(messages, resp.ToParam())
-
-		// If no tool calls, the agent is done
-		if len(toolResults) == 0 {
-			break
-		}
-
-		messages = append(messages, anthropic.NewUserMessage(toolResults...))
+	if err != nil {
+		return &FixResult{
+			Output: outputStr,
+		}, fmt.Errorf("claude CLI: %w\n%s", err, outputStr)
 	}
 
-	output := outputLog.String()
-
-	// Check for CANNOT_FIX in the last portion of output
-	lines := strings.Split(strings.TrimSpace(output), "\n")
+	// Check for CANNOT_FIX in the last few lines
+	lines := strings.Split(strings.TrimSpace(outputStr), "\n")
 	lastLines := lines
 	if len(lastLines) > 5 {
 		lastLines = lastLines[len(lastLines)-5:]
@@ -108,21 +54,42 @@ func (a *Agent) Fix(ctx context.Context, eg *db.ErrorGroup, occs []db.ErrorOccur
 		if strings.Contains(line, "CANNOT_FIX") {
 			return &FixResult{
 				CannotFix: true,
-				Output:    output,
+				Output:    outputStr,
 			}, nil
 		}
 	}
 
 	return &FixResult{
 		Success: true,
-		Output:  output,
+		Output:  outputStr,
 	}, nil
 }
 
-func truncate(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+func buildPrompt(systemPrompt string, eg *db.ErrorGroup, occs []db.ErrorOccurrence) string {
+	var sb strings.Builder
+
+	sb.WriteString(systemPrompt)
+	sb.WriteString("\n\n")
+	sb.WriteString(fmt.Sprintf("Error class: %s\n", eg.Name))
+	sb.WriteString(fmt.Sprintf("Error message: %s\n", eg.Message))
+	sb.WriteString(fmt.Sprintf("Occurrences: %d\n", eg.Occurrences))
+	sb.WriteString(fmt.Sprintf("New Relic link: %s\n\n", eg.Link))
+
+	if len(occs) > 0 {
+		sb.WriteString("Recent occurrences:\n\n")
+		for i, o := range occs {
+			occ := map[string]interface{}{
+				"error.class":       o.ErrorClass,
+				"error.message":     o.Message,
+				"host":              o.Host,
+				"request.uri":       o.RequestURI,
+				"transactionUiName": o.TransactionName,
+				"timestamp":         o.OccurredAt,
+			}
+			data, _ := json.MarshalIndent(occ, "", "  ")
+			sb.WriteString(fmt.Sprintf("Occurrence %d:\n%s\n\n", i+1, string(data)))
+		}
 	}
-	return s
+
+	return sb.String()
 }

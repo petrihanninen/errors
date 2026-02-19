@@ -166,8 +166,6 @@ func runFix() error {
 		return fmt.Errorf("clone repo: %w", err)
 	}
 
-	fixAgent := agent.New(cfg.AnthropicAPIKey, repoDir, customPrompt)
-
 	var doneCount, failedCount int
 
 	for i, eg := range todoErrors {
@@ -201,12 +199,12 @@ func runFix() error {
 			log.Printf("Warning: failed to get occurrences: %v", err)
 		}
 
-		log.Println("Running agent to fix the error...")
-		result, err := fixAgent.Fix(ctx, &eg, occs)
+		log.Println("Running claude to fix the error...")
+		result, err := agent.Fix(repoDir, customPrompt, &eg, occs)
 		if err != nil {
-			log.Printf("Agent error: %v", err)
+			log.Printf("Claude error: %v", err)
 			repo.Cleanup(branchName)
-			markFailed(ctx, store, eg.ID, attemptID, fmt.Sprintf("agent error: %v", err))
+			markFailed(ctx, store, eg.ID, attemptID, fmt.Sprintf("claude error: %v", err))
 			failedCount++
 			continue
 		}
